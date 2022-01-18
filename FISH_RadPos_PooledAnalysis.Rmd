@@ -1,0 +1,953 @@
+---
+title: "FISH_3D_Distance"
+author: "Gianluca Pegoraro"
+date: "Dec 21, 2015"
+output: html_document
+---
+
+```{r}
+library('plyr')
+library('dplyr')
+library('ggplot2')
+library('stringr')
+library('knitr')
+library('reshape2')
+library('data.table')
+```
+
+```{r, include=FALSE, warning=FALSE}
+opts_chunk$set(fig.path='R_Output/', cache = FALSE, cache.path='cache_final/', dev=c("png", "pdf"), dpi = 600, fig.width=7, fig.height=7, message=FALSE, warning=FALSE)
+```
+
+### Pull in Hi-C data for metadata
+```{r readHiCMetadata}
+dt.HiC <- fread("pairs_statistics_oct2018.csv")
+```
+
+### Find and read the spots files
+
+Set RegEx patterns for directory searches for cell level data and spot data in all colors.
+```{r regexFilename, results='hide'}
+pat.p <- "^Pairs.txt$"
+pat.s <- "^Spots.txt$"
+
+pat.list <- list(p=pat.p, s=pat.s)
+```
+
+Recursively search the `ObjectLevelData` directory and its subdirectories for files whose name includes the RegEx patterns defined two chunks above. The `path.list` functon outputs absolute file names. `path.list` is a list containing all the filenames on a per cell-level or per color-level (i.e. gr, gf or fr) basis.
+```{r directorySearch, results='hide'}
+directory.search <- function(x){
+  pat <- dir(pattern = x, full.names = TRUE, recursive = TRUE, include.dirs = TRUE)
+}
+
+path.list <- llply(pat.list, directory.search)
+```
+
+Extract file names from absolut path and set them as list element names. 
+```{r trimNames, results='hide'}
+trim.names <- function(x){
+  names(x) <- basename(x) # This assigns the filename to the file that it is read
+  y <- x ## This is necessary because of scoping issues
+}
+
+path.list <- llply(path.list, trim.names) 
+```
+
+Recursively read and merge object level data files as data.frames. Rows are labeled with relative filenames (The `.id` variable). This and the previous chunks are slightly modified tricks adopted from H. Wickam ["Tidy Data" paper](http://vita.had.co.nz/papers/tidy-data.pdf).
+
+```{r readMerge, results='hide'}
+read.merge <- function(x){
+  dt <-as.data.table(ldply(x, fread)) 
+}
+
+dt.list <- llply(path.list, read.merge)
+```
+
+Second, read in bioinformatic data from ENCODE and 4DN and collate it into a table on a by-probe basis:
+```{r readSequencingData}
+dt.bed = fread("Bioinformatics_Data/Probes_LADDist.txt")
+dt.ENCODE = fread("Bioinformatics_Data/ENCODE_BJ_Compiled_out.txt")
+dt.4DN = fread("Bioinformatics_Data/4DN_HFF_Compiled_out.txt", fill=TRUE)
+
+dt.4DN.average <- dt.4DN[,list(LaminB1 = median(ct_LaminB1DamIDHFF_7256.value),
+                               Compartment = median(ct_HFFCompartments_7382.valueAverage)),
+                         by=list(locus_ID)]
+
+dt.ENCODE.average <- dt.ENCODE[,list(H3K27me3 = median(hub_2441861_b0ad8a57225d5efca1ab752ff35f7ae0.value),
+                                     H3K36me3 = median(hub_2441861_defe32d687110f3d9e3c86fbb0a33dda.valueAverage),
+                                     H3K4me3 = median(hub_2441861_e1c84294df1470450fe1c133ebccda94.valueAverage)),
+                         by=list(locus_ID)]
+
+dt.bed[,V6:=NULL]
+dt.bed <- dt.bed[complete.cases(dt.bed),]
+dt.bed[, locus_ID := paste0(c(chr, ":", start+1, "-", end), collapse=""), by=list(chr, start, end, probe)]
+dt.bed[, Genome_Position := (start+end)/2]
+
+
+setkey(dt.bed, locus_ID)
+setkey(dt.4DN, locus_ID)
+setkey(dt.4DN.average, locus_ID)
+setkey(dt.ENCODE, locus_ID)
+setkey(dt.ENCODE.average, locus_ID)
+
+
+dt.sequencing <- dt.4DN.average[dt.ENCODE.average,]
+dt.sequencing <- dt.sequencing[dt.bed,]
+```
+
+Separate the cell level data from the distance and spot level data.
+
+```{r deleteDtList, results='asis'}
+dt.spots <- dt.list$s 
+dt.all <- dt.list$p
+```
+
+```{r determineThreshold}
+dt.all[SpotDist.micron > 1,SpotDist.Threshold := "A (none)"]
+dt.all[SpotDist.micron<=1, SpotDist.Threshold := "B (1um)"]
+dt.all[SpotDist.micron<=0.35, SpotDist.Threshold := "C (350nm)"]
+
+# Also add nudged distance, to make log plots on the basis of distance more sensible if necessary (check minimum value, see if it's nonzero first)
+dt.all[,SpotDist.nudged := SpotDist.micron + 0.0001]
+```
+
+
+```{r QCFilters}
+dt.all[,`:=`(Probe1PercDiploid = (PercDiploidGreen*(Channel1=="Green")) + 
+                                    (PercDiploidRed*(Channel1=="Red") + 
+                                     (PercDiploidFarRed*(Channel1=="Far Red"))),
+             Probe2PercDiploid = (PercDiploidGreen*(Channel2=="Green")) + 
+                                    (PercDiploidRed*(Channel2=="Red") + 
+                                     (PercDiploidFarRed*(Channel2=="Far Red"))))]
+
+dt.spots[,`:=`(PercDiploid = (PercDiploidGreen*(color=="Green")) + 
+                                    (PercDiploidRed*(color=="Red") + 
+                                     (PercDiploidFarRed*(color=="Far Red"))))]
+
+
+QC_thresh <- 0.6
+```
+
+```{r probeNameSanitization}
+dt.all[Probe1 == 88, Probe1 := 89]
+dt.all[Probe2 == 88, Probe2 := 89]
+
+dt.spots[,Probe := (Green_Probe*(color=="Green") + 
+                     Red_Probe*(color=="Red") + 
+                     FarRed_Probe*(color=="Far Red"))]
+
+dt.spots[Probe == 88, Probe := 89]
+
+dt.all[,`:=`(Probe1.HiC = ceiling(Probe1),
+             Probe2.HiC = ceiling(Probe2))]
+
+dt.all[, Probe_Pair := interaction(Probe1, Probe2)]
+```
+
+```{r SynchHiC}
+setkey(dt.all, chr, Probe1.HiC, Probe2.HiC)
+setkey(dt.HiC, chr, TargetBaitID1, TargetBaitID2)
+
+dt.all.HiC <- dt.all[dt.HiC,]
+```
+
+```{r AddGenomePositions}
+dt.all[,chr_formatted := paste0(c("chr", chr), collapse=""), by=list(chr, Probe1)]
+
+setkey(dt.all, chr_formatted, Probe1)
+setkey(dt.bed, chr, probe)
+
+dt.all <- dt.all[dt.bed[,c("chr", "probe", "Genome_Position")]]
+dt.all <- rename(dt.all, c(GP_1 = "Genome_Position"))
+
+setkey(dt.all, chr_formatted, Probe2)
+dt.all <- dt.all[dt.bed[,c("chr", "probe", "Genome_Position")]]
+dt.all <- rename(dt.all, c(GP_2 = 'Genome_Position'))
+
+dt.all[, Genomic_Distance := abs(GP_2 - GP_1)]
+```
+
+
+```{r normAreaShells}
+# very low representation in shell five because dilated nucleus + skinny shell, so lump these in with shell 4. 
+dt.all[AreaShell.spot1.COG == 5, AreaShell.spot1.COG:=4]
+dt.all[AreaShell.spot2.COG == 5, AreaShell.spot2.COG:=4]
+
+# Also recalculate equi-area shell assignment for all spots
+dt.spots[, AreaShell.COG := 4]
+dt.spots[r.cog < sqrt(0.8), AreaShell.COG := 3]
+dt.spots[r.cog < sqrt(0.6), AreaShell.COG := 2]
+dt.spots[r.cog < sqrt(0.4), AreaShell.COG := 1]
+dt.spots[r.cog < sqrt(0.2), AreaShell.COG := 0]
+```
+
+```{r AssignRegions}
+dt.all[,Region := "Chr1 Set 1"]
+
+dt.all[chr==1 & Probe1 %in% c(354,385,422, 463, 476, 360, 375, 389), Region :="Chr1 Set 2"]
+
+dt.all[chr==17, Region := "Chr17"]
+dt.all[chr==18, Region := "Chr18"]
+dt.all[chr==4, Region := "Chr 4 Set 1"]
+dt.all[chr==4 & Probe1 > 500, Region := "Chr4 Set 2"]
+
+dt.all$Region <- factor(dt.all$Region, levels=c("Chr1 Set 1", "Chr1 Set 2", "Chr17", "Chr18", "Chr4 Set 1", "Chr4 Set 2"))
+```
+
+```{r AssignLADs}
+dt.all[,LAD_Stat := "Test"]
+
+dt.all[chr==1 & Probe1 %in% c(52,23, 73, 120, 255,354,385,422), LAD_Stat := "LAD"]
+dt.all[chr==1 & Probe1 %in% c(11,74,80, 249, 463,476), LAD_Stat := "Border"]
+dt.all[chr==1 & Probe1 %in% c(88, 91, 232, 441,360,375, 389, 433), LAD_Stat := "Inter-LAD"]
+
+dt.all[chr==17 & Probe1 %in% c(40, 133, 142, 146, 206, 263, 278), LAD_Stat := "LAD"]
+dt.all[chr==17 & Probe1 %in% c(86, 121, 123, 156, 195, 256), LAD_Stat := "Inter-LAD"]
+
+dt.all[chr==18 & Probe1 %in% c(157,163,167,296,123, 193, 303), LAD_Stat := "LAD"]
+dt.all[chr==18 & Probe1 %in% c(141,186,250), LAD_Stat := "Border"]
+dt.all[chr==18 & Probe1 %in% c(11,89), LAD_Stat := "Inter-LAD"]
+
+dt.all[chr==4 & Probe1 %in% c(220, 221, 224, 226.5), LAD_Stat := "Border"]
+dt.all[chr==4 & Probe1 %in% c(222, 223, 226, 227, 228), LAD_Stat := "LAD"]
+dt.all[chr==4 & Probe1 %in% c(225, 225.5, 229, 231), LAD_Stat := "Inter-LAD"]
+dt.all[chr==4 & Probe1 > 500 , LAD_Stat := "Inter-LAD"]
+
+dt.all.filtered <- dt.all[Probe1PercDiploid > QC_thresh & Probe2PercDiploid > QC_thresh,]
+```
+
+```{r pullSimShells}
+dt.sameShells <- dt.all[AreaShell.spot1.COG==AreaShell.spot2.COG,]
+```
+
+Pull out data by allele for allele-independence plots:
+
+```{r pullAlleles}
+dt.2spots <- dt.spots[SpotIndex %in% c(1,2) & PercDiploid > 0.6,]
+
+dt.alleles <- dcast(dt.2spots, AssayIndex + nrow + ncol + color + FieldIndex + CellIndex + 
+                      chr + Probe + Cell_Type + Culture_Condition ~ SpotIndex, mean,
+                    value.var="r.cog")
+
+dt.alleles <- rename(dt.alleles, c(r.cog.1 = '1', r.cog.2 = '2'))
+
+rm(dt.2spots)
+```
+
+Pull out data by green spot for clustering information:
+
+```{r pullClusters}
+dt.all.trips <- dcast(dt.sameShells[PercDiploidGreen>QC_thresh & PercDiploidRed>QC_thresh & PercDiploidFarRed > QC_thresh], 
+                      AssayIndex + nrow + ncol + Green_Probe + Red_Probe + FarRed_Probe + chr + 
+                            FieldIndex + CellIndex + SpotIndex1 + Spot1.r.cog ~ Channel2, min,
+                              subset = .(Channel1 == "Green"), value.var = "SpotDist.micron")
+
+
+dt.all.trips <- rename(dt.all.trips, c(SpotDist.Red = Red, SpotDist.FarRed = `Far Red`))
+
+dt.all.trips <- dt.all.trips[is.finite(SpotDist.Red) & is.finite(SpotDist.FarRed),]
+
+dt.all.trips[SpotDist.Red > 1 & SpotDist.FarRed > 1, Triplet:="A (none)"]
+dt.all.trips[SpotDist.Red <= 1 & SpotDist.FarRed > 1, Triplet:="B (paired with red)"]
+dt.all.trips[SpotDist.Red > 1 & SpotDist.FarRed <= 1, Triplet:="C (paired with far red)"]
+dt.all.trips[SpotDist.Red <= 1 & SpotDist.FarRed <= 1, Triplet:="D (triplet)"]
+```
+
+Calculate coefficients of variation for groups by radial position bin:
+
+```{r getCoVbyRadPos}
+dt.variabilities.bin1 <- dt.all[, list(StdDev.bybin1 = sd(SpotDist.micron),
+                                  CoV.bybin1 = sd(SpotDist.micron)/mean(SpotDist.micron),
+                                  N.bybin1 = .N),
+                           by=list(Probe1, Probe2, AreaShell.spot1.COG)]
+
+dt.variabilities.bin2 <- dt.all[, list(StdDev.bybin2 = sd(SpotDist.micron),
+                                  CoV.bybin2 = sd(SpotDist.micron)/mean(SpotDist.micron),
+                                  N.bybin2 = .N),
+                           by=list(Probe1, Probe2, AreaShell.spot2.COG) ]
+
+```
+
+```{r calculatePercents}
+dt.counts <- dt.all.filtered[,list(All = .N,
+                                    "100nm" = sum(SpotDist.micron < 0.1),
+                                    "350nm" = sum(SpotDist.micron < 0.35),
+                                    "1um" = sum(SpotDist.micron < 1),
+                                   "Median" = median(SpotDist.micron)),
+                              by = list(Cell_Type, chr, Region, Probe1, Probe2, Probe_Pair)]
+```
+
+```{r calculatePercentsByShell}
+dt.counts.positional <- dt.all.filtered[,list(All = .N,
+                                              "100nm" = sum(SpotDist.micron < 0.1),
+                                              "350nm" = sum(SpotDist.micron < 0.35),
+                                              "1um" = sum(SpotDist.micron < 1)),
+                                        by = list(Cell_Type, chr, Region, Probe1, Probe2, Probe_Pair, AreaShell.spot1.COG)]
+
+dt.counts.positional.melted <- melt(dt.counts.positional, id.vars = c("chr", "Region", "Cell_Type", "Probe1", "Probe2", "Probe_Pair", "AreaShell.spot1.COG"),
+                                    measure.vars = c("All", "100nm", "350nm", "1um"))
+
+dt.counts.positional.melted[,variable:=factor(variable, levels=c("All", "1um", "350nm", "100nm"))]
+```
+
+#Subsample the data to allow eas(ier) comparison between H1 and HFF: 
+1) Define which probe pairs are measured in H1s and HFFs (intersected_ProbePairs)
+2) Pare down dt.all.filtered to include only those probe pairs
+3) Subsample for 1000 rows with replacement
+
+(But try to do it without saving the subset to save even a little bit of memory yikes)
+```{r subsample}
+H1_ProbePairs <- unique(dt.all.filtered[Cell_Type == "H1", Probe_Pair])
+HFF_ProbePairs <- unique(dt.all.filtered[Cell_Type == "HFF", Probe_Pair])
+intersected_ProbePairs <- intersect(H1_ProbePairs, HFF_ProbePairs)
+
+dt.all.subsampled <- data.table(dt.all.filtered[Probe_Pair %in% intersected_ProbePairs] %>% 
+                      group_by(Probe_Pair, Cell_Type) %>% 
+                      sample_n(1000, replace=TRUE))
+```
+
+
+#Summarize data by median radial position & most common shell; add in bioinformatic data
+
+First, calculate average radial position and most-common-shell for each gene on a per-well basis (with % diploid), and overall after filtering by % diploid
+```{r generateRadPosStatsByProbe}
+dt.loci <- dt.spots[, list(rad.pos.median = median(r.cog), 
+                           rad.pos.mean = mean(r.cog),
+                           rad.shell.mode = which.max(tabulate(AreaShell.COG+1))-1,
+                           count = .N),
+                    by = list(AssayIndex, Cell_Type, Culture_Condition, 
+                              chr, Probe, color, PercDiploid)]
+
+dt.loci.pooled <- dt.spots[PercDiploid > 0.6, list(rad.pos.median = median(r.cog), 
+                           rad.pos.mean = mean(r.cog),
+                           rad.shell.mode = which.max(tabulate(AreaShell.COG+1))-1, 
+                           count = .N),
+                    by = list(Cell_Type, chr, Probe)]
+```
+
+And synch up with the pooled probe level data:
+```{r addSequencingToProbeRadPos}
+dt.loci.pooled[, chr_formatted := paste0(c("chr", chr), collapse=""), by=list(chr, Probe)]
+
+setkey(dt.sequencing, chr, probe)
+setkey(dt.loci.pooled, chr_formatted, Probe)
+
+dt.loci.pooled <- dt.loci.pooled[dt.sequencing]
+
+dt.loci.pooled.HFF <- dt.loci.pooled[complete.cases(dt.loci.pooled) & Cell_Type == "HFF",]
+```
+
+
+```{r addPositionInfoToAllData}
+dt.bed[,Genome_Position := (start+end)/2]
+dt.spots[, chr_formatted := paste0(c("chr", chr), collapse=""), by=list(.id, AssayIndex, nrow, ncol, color, 
+                                                                        FieldIndex, CellIndex, SpotIndex, 
+                                                                        Cell_Type, Culture_Condition, PercDiploid,
+                                                                        chr)]
+
+setkey(dt.bed, chr, probe)
+setkey(dt.spots, chr_formatted, Probe)
+
+dt.spots <- dt.spots[dt.bed, nomatch=0]
+```
+### Graphical Exploratory Data Analysis and Calculations
+##' Color-blind friendly palette
+##' From \url{http://www.cookbook-r.com/Graphs/Colors_(ggplot2)/}
+##' @title Color-blind friendly palette
+##' @param palette Choose "cb", "rcb", or "bly". cb is the Winston
+##' Chang color blind palette; rcb is that palette in reverse; bly
+##' puts the yellow and blue in the palette first.
+##' @return Variations on an eight-color color-blind friendly palette.
+##' @author Winston Chang / Kieran Healy
+##' @export
+
+```{r setThemeandPalette, include='false'}
+
+my.colors <- function(palette="cb"){
+  ### The palette with grey:
+  cb.palette <- c("#999999", "#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7")
+  ## Same one Reversed
+  rcb.palette <- rev(cb.palette)
+  ## Blue and yellow first choices
+  bly.palette <- c("#E69F00", "#0072B2", "#999999", "#56B4E9", "#009E73", "#F0E442", "#D55E00", "#CC79A7")
+  if (palette=="cb") return(cb.palette) else if (palette=="rcb") return(rcb.palette) else if (palette=="bly") return(bly.palette) else stop("Choose cb, rcb, or bly only.")
+}
+
+theme_set(theme_minimal())
+theme_update(axis.text.x=element_text(size=12, angle = -90, hjust = 0),
+            axis.text.y=element_text(size=12),
+            axis.title.x=element_text(size=16),
+            axis.title.y=element_text(size=16, angle=90),
+            legend.text=element_text(size=12),
+            legend.title=element_text(size=12),
+            strip.text=element_text(size=12))
+```
+
+
+## STUFF THAT IS GOING INTO FIGURES GOES UP HERE
+
+# Figure S1: Technical imaging and segmenation stuff
+```{r Selected_ControlDist_CDF, fig.width=6.5, fig.height=2.5}
+dt.selected.distancecontrols <- dt.all.subsampled[Cell_Type == "HFF" & Probe_Pair %in% c("120.120", "611.611", "89.91", "73.74", "226.226.5", "614.614.5", "614.615", "609.614", "23.52", "52.120")]
+
+dt.selected.distancecontrols$Probe_Pair <- with(dt.selected.distancecontrols, reorder(Probe_Pair, Genomic_Distance, median))
+
+cumulDist <- ggplot(dt.selected.distancecontrols, mapping=aes(x=SpotDist.micron, group=Probe_Pair))
+
+cumulDist + stat_ecdf(size=1, aes(color=log10((Genomic_Distance/1000)+1))) +
+        scale_color_viridis_c("Genomic Distance\n(kbp, log 10)") +
+        scale_x_continuous("2D Distance (micron)", limits=c(0,8)) +
+        scale_y_continuous("Density", breaks=c(0,1))
+```
+
+```{r Selected_ControlDist_Violbox, fig.width=6.5, fig.height=4}
+violbox <- ggplot(dt.selected.distancecontrols, mapping=aes(y=SpotDist.micron, x=Probe_Pair))
+
+violbox + geom_jitter(width=0.3, alpha=0.2, aes(color=log10((Genomic_Distance/1000)+1))) + 
+        geom_boxplot(width = 0.3) +
+        theme(legend.position="bottom")+
+        scale_color_viridis_c("Genomic Distance (kbp, log 10)") +
+        scale_x_discrete("Probe Pair") +
+        scale_y_continuous("2D Distance", limits=c(0,8))
+```
+
+
+# Figure 1: Overall radial position and sequencing data
+
+```{r AllRadPos_CDF, fig.width=6.5, fig.height=2.5}
+cumulDist <- ggplot(dt.spots[Cell_Type == "HFF",], mapping=aes(x=r.cog, color=Genome_Position, group=Genome_Position))
+
+cumulDist + stat_ecdf(size=1, aes(color=Genome_Position)) +
+        facet_wrap(. ~ chr) +
+        scale_color_viridis_c("Genomic Position") +
+        scale_x_continuous("Radial Position", limits=c(0,1)) +
+        scale_y_continuous("Density", breaks=c(0,1))
+```
+
+```{r meltLociPooled}
+dt.loci.melted <- melt(dt.loci.pooled.HFF, id.vars = c("Cell_Type", "chr", "start", "end", "Probe", "rad.pos.median", "rad.pos.mean", "rad.shell.mode", "count", "chr_formatted", "locus_ID"), variable.name="Assay")
+```
+
+```{r scatter_medRadPos_v_sequencing, fig.width=6.5, fig.height=2.5}
+plot <- ggplot(dt.loci.melted[Assay %in% c("LaminB1", "Compartment", "H3K27me3", "H3K4me3"),], 
+               mapping=aes(y=rad.pos.median, x=value, color=as.factor(rad.shell.mode)))
+
+plot + geom_point(size=2) +
+  scale_color_viridis_d("Most Common\nEqui-Area\nShell") +
+  scale_y_continuous("Median Radial\nPosition", limits=c(0,1)) +
+  facet_grid(.~Assay, scales="free")+
+  scale_x_continuous("Normalized Signal")
+```
+
+```{r scatter.by.allele.selected.forbranch, fig.height=2.5, fig.width=6.5}
+scatter <- ggplot(data.table(dt.alleles[chr==1 & Probe %in% c(11,52,91,476),] %>% 
+                      group_by(Probe) %>% 
+                      sample_n(1000, replace=TRUE)), 
+                  mapping=aes(x=r.cog.1, y=r.cog.2))
+
+scatter + stat_density2d_filled() +
+  facet_wrap(.~Probe, ncol=4) +
+  scale_fill_viridis_d("Density", guide=guide_colorsteps(barheight=6))+
+  scale_x_continuous("Radial Position (Homolog 1)", limits=c(-0.01,1.01)) + 
+  scale_y_continuous("Radial Position\n(Homolog 2)", limits=c(-0.01,1.01))
+```
+
+```{r scatter.by.allele.selected, fig.height=3.25, fig.width=2.75}
+scatter <- ggplot(data.table(dt.alleles[chr==1 & Probe %in% c(11,52,91,476),] %>% 
+                      group_by(Probe) %>% 
+                      sample_n(1000, replace=TRUE)), 
+                  mapping=aes(x=r.cog.1, y=r.cog.2))
+
+scatter + stat_density2d_filled() +
+  facet_wrap(.~Probe, ncol=2) +
+  scale_fill_viridis_d("Density", guide=guide_colorsteps(barheight=10))+
+  scale_x_continuous("Radial Position (Allele 1)", limits=c(-0.01,1.01)) + 
+  scale_y_continuous("Radial Position (Allele 2)", limits=c(-0.01,1.01))
+```
+
+```{r scatter.by.locus.selected, fig.height=3.25, fig.width=3.75}
+scatter <- ggplot(data.table(dt.all.filtered[chr==4 & Probe1 == 609 & Probe2 %in% c(610, 611, 614, 616, 617, 618),] %>% 
+                      group_by(Probe2) %>% 
+                      sample_n(1000, replace=TRUE)), 
+                  mapping=aes(x=Spot1.r.cog, y=Spot2.r.cog))
+
+scatter + stat_density2d_filled() +
+  facet_wrap(.~Probe2, ncol=3) +
+  scale_fill_viridis_d("Density", guide=guide_colorsteps(barheight=10))+
+  scale_x_continuous("Radial Position: Upstream Locus", limits=c(-0.01,1.01)) + 
+  scale_y_continuous("Radial Position:\nDownstream Locus", limits=c(-0.01,1.01))
+```
+
+```{r scatter.by.locus.selected.forbranch, fig.height=2.5, fig.width=8}
+scatter <- ggplot(data.table(dt.all.filtered[chr==4 & Probe1 == 609 & Probe2 %in% c(610, 611, 614, 616, 617, 618),] %>% 
+                      group_by(Probe2) %>% 
+                      sample_n(1000, replace=TRUE)), 
+                  mapping=aes(x=Spot1.r.cog, y=Spot2.r.cog))
+
+scatter + stat_density2d_filled() +
+  facet_wrap(.~Probe2, ncol=6) +
+  scale_fill_viridis_d("Density", guide=guide_colorsteps(barheight=6))+
+  scale_x_continuous("Radial Position: Upstream Locus", limits=c(-0.01,1.01), breaks=c(0,0.5,1)) + 
+  scale_y_continuous("Radial Position:\nDownstream Locus", limits=c(-0.01,1.01), breaks=c(0,0.5,1))
+```
+
+
+```{r CDF_LADDistColors_4, fig.width=3.25, fig.height=2.5}
+cumulDist <- ggplot(dt.spots[Cell_Type == "HFF" & chr==4 & Probe > 300 & Probe != 613,], 
+                    mapping=aes(x=r.cog, group=Genome_Position))
+
+cumulDist + stat_ecdf(size=1, aes(color=Distance_to_LAD/1000)) +
+        scale_color_viridis_c("Distance\nto LAD\n(kbp)", begin=1, end=0) +
+        scale_x_continuous("Radial Position", limits=c(0,1)) +
+        scale_y_continuous("Density")
+```
+
+```{r CDF_LADDistColors_17, fig.width=3.25, fig.height=2.5}
+cumulDist <- ggplot(dt.spots[Cell_Type == "HFF" & chr==17,], 
+                    mapping=aes(x=r.cog, group=Genome_Position))
+
+cumulDist + stat_ecdf(size=1, aes(color=Distance_to_LAD/1000)) +
+        scale_color_viridis_c("Distance\nto LAD\n(kbp)", begin=1, end=0) +
+        scale_x_continuous("Radial Position", limits=c(0,1)) +
+        scale_y_continuous("Density")
+```
+
+# Figure 3: Rad Pos Vs Spot Distance
+
+Calculate correlations for heat maps
+```{r lm.dt.all}
+dt.all.subsampled <- data.table(dt.all.filtered %>% 
+                      group_by(Probe_Pair, Cell_Type) %>% 
+                      sample_n(1000, replace=TRUE))
+
+testcorrelation <- function(dt){
+  spot1.p <- anova(lm(SpotDist.micron ~ Spot1.r.cog, data=dt))$`Pr(>F)`[1]
+  spot2.p <- anova(lm(SpotDist.micron ~ Spot2.r.cog, data=dt))$`Pr(>F)`[1]
+  spot1.m <- summary(lm(SpotDist.micron ~ Spot1.r.cog, data=dt))$coefficients[2]
+  spot2.m <- summary(lm(SpotDist.micron ~ Spot2.r.cog, data=dt))$coefficients[2]
+  data.table("Spot1.M" = spot1.m, "Spot2.M" = spot2.m,
+             "Spot1.P" = spot1.p, "Spot2.P" = spot2.p)
+}
+
+dt.lms <- data.table(ddply(dt.all.subsampled, .(chr, Probe1, Probe2, Cell_Type, Region), testcorrelation))
+
+dt.lms[,`:=`(Spot1.P.Maxxed = max(Spot1.P, 0.00001),
+             Spot2.P.Maxxed = max(Spot2.P, 0.00001)), 
+       by=list(chr, Probe1, Probe2, Cell_Type)]
+```
+
+```{r scatter.52vvar.radposvdist.forbranch, fig.height=2.5, fig.width=6}
+scatter <- ggplot(dt.all.filtered[chr==1 & Probe1 == 52 & Probe2 %in% c(994, 91),], 
+                  mapping=aes(x=SpotDist.micron, y=Spot1.r.cog))
+
+scatter + stat_density2d_filled() +
+  facet_wrap(.~Probe2, ncol=2) +
+  scale_fill_viridis_d("Density", guide=guide_colorsteps(barheight=6))+
+  scale_x_continuous("2D Distance (microns)", limits=c(-0.01,5), breaks=c(0:5)) + 
+  scale_y_continuous("Radial Position:\nUpstream Locus", limits=c(-0.01,1.01), breaks=c(0,0.5,1))
+```
+
+```{r scatter.52vvar.radposvdist.forpaper, fig.height=4, fig.width=2.5}
+scatter <- ggplot(dt.all.filtered[chr==1 & Probe1 == 52 & Probe2 %in% c(994, 91),], 
+                  mapping=aes(x=SpotDist.micron, y=Spot1.r.cog))
+
+scatter + stat_density2d_filled() +
+  facet_wrap(.~Probe2, ncol=1) +
+  scale_fill_viridis_d("Density", guide=guide_colorsteps(barheight=10, barwidth=0.5))+
+  scale_x_continuous("2D Distance\n(microns)", limits=c(-0.01,5), breaks=c(0:5)) + 
+  scale_y_continuous("Radial Position", limits=c(-0.01,1.01), breaks=c(0,0.5,1))
+```
+
+```{r scatter.52vvar.H1.radposvdist.forpaper, fig.height=2, fig.width=6.5}
+scatter <- ggplot(dt.all.filtered[chr==1 & Probe1 == 52 & Probe2 %in% c(73, 91),], 
+                  mapping=aes(x=SpotDist.micron, y=Spot1.r.cog))
+
+scatter + stat_density2d_filled() +
+  facet_wrap(interaction(Cell_Type, Probe_Pair)~., nrow=1) +
+  scale_fill_viridis_d("Density", guide=guide_colorsteps(barheight=5, barwidth=0.5))+
+  scale_x_continuous("2D Distance (microns)", limits=c(-0.01,5), breaks=c(0:5)) + 
+  scale_y_continuous("Radial Position", limits=c(-0.01,1.01), breaks=c(0,0.5,1))
+```
+
+Heat map: color is coefficient (directional), alpha is p-value (brighter = more significant)
+```{r heatmaps.spot1.rvdist.chr1, fig.width=4, fig.height=4}
+plot <- ggplot(dt.lms[dt.lms$Cell_Type == "HFF" & chr==1,], 
+               mapping=aes(x=as.factor(Probe1), y=as.factor(Probe2), 
+                           fill=Spot1.M, alpha=-log10(Spot1.P)))
+
+plot + geom_tile() +
+  facet_wrap(.~chr, scales="free") +
+  scale_x_discrete("Upstream Probe") + 
+  scale_y_discrete("Downstream Probe") +
+  scale_alpha_continuous("Sig.\n(log10)", limits=c(0,10))+
+  scale_fill_viridis_c("Direction", limits=c(-13.007, 13.007))
+```
+
+```{r heatmaps.spot1.rvdist.chr4, fig.width=4, fig.height=4}
+plot <- ggplot(dt.lms[dt.lms$Cell_Type == "HFF" & chr==4,], 
+               mapping=aes(x=as.factor(Probe1), y=as.factor(Probe2), 
+                           fill=Spot1.M, alpha=-log10(Spot1.P)))
+
+plot + geom_tile() +
+  facet_wrap(.~chr, scales="free") +
+  scale_x_discrete("Upstream Probe") + 
+  scale_y_discrete("Downstream Probe") +
+  scale_alpha_continuous("Significance\nof correlation\n(log10)", limits=c(0,10))+
+  scale_fill_viridis_c("Direction\nof correlation", limits=c(-13.007, 13.007))
+```
+
+```{r heatmaps.spot1.rvdist.chr1718, fig.width=3.25, fig.height=4}
+plot <- ggplot(dt.lms[dt.lms$Cell_Type == "HFF" & chr %in% c(17,18),], 
+               mapping=aes(x=as.factor(Probe1), y=as.factor(Probe2), 
+                           fill=Spot1.M, alpha=-log10(Spot1.P)))
+
+plot + geom_tile() +
+  facet_wrap(.~chr, scales="free", nrow=2) +
+  scale_x_discrete("Upstream Probe") + 
+  scale_y_discrete("Downstream Probe") +
+  scale_alpha_continuous("Significance\nof correlation\n(log10)", limits=c(0,10))+
+  scale_fill_viridis_c("Direction\nof correlation", limits=c(-13.007, 13.007))
+```
+
+```{r heatmaps.spot2.rvdist.chr1, fig.width=4, fig.height=4}
+plot <- ggplot(dt.lms[dt.lms$Cell_Type == "HFF" & chr==1,], 
+               mapping=aes(x=as.factor(Probe1), y=as.factor(Probe2), 
+                           fill=Spot2.M, alpha=-log10(Spot2.P)))
+
+plot + geom_tile() +
+  facet_wrap(.~chr, scales="free") +
+  scale_x_discrete("Upstream Probe") + 
+  scale_y_discrete("Downstream Probe") +
+  scale_alpha_continuous("Significance\nof correlation\n(log10)", limits=c(0,10))+
+  scale_fill_viridis_c("Direction\nof correlation", limits=c(-13.007, 13.007))
+```
+```{r heatmaps.spot2.rvdist.chr4, fig.width=4, fig.height=4}
+plot <- ggplot(dt.lms[dt.lms$Cell_Type == "HFF" & chr==4,], 
+               mapping=aes(x=as.factor(Probe1), y=as.factor(Probe2), 
+                           fill=Spot2.M, alpha=-log10(Spot2.P)))
+
+plot + geom_tile() +
+  facet_wrap(.~chr, scales="free") +
+  scale_x_discrete("Upstream Probe") + 
+  scale_y_discrete("Downstream Probe") +
+  scale_alpha_continuous("Significance\nof correlation\n(log10)", limits=c(0,10))+
+  scale_fill_viridis_c("Direction\nof correlation", limits=c(-13.007, 13.007))
+```
+
+```{r heatmaps.spot2.rvdist.chr1718, fig.width=3.25, fig.height=4}
+plot <- ggplot(dt.lms[dt.lms$Cell_Type == "HFF" & chr %in% c(17,18),], 
+               mapping=aes(x=as.factor(Probe1), y=as.factor(Probe2), 
+                           fill=Spot2.M, alpha=-log10(Spot2.P)))
+
+plot + geom_tile() +
+  facet_wrap(.~chr, scales="free", nrow=2) +
+  scale_x_discrete("Upstream Probe") + 
+  scale_y_discrete("Downstream Probe") +
+  scale_alpha_continuous("Significance\nof correlation\n(log10)", limits=c(0,10))+
+  scale_fill_viridis_c("Direction\nof correlation", limits=c(-13.007, 13.007))
+```
+
+CDFs of three example pairs with three different patterns
+```{r CDFS_SpotDist_byAreaShell_Selected.spot1.52, fig.width=3.5, fig.height=3}
+plot <- ggplot(dt.all.filtered[Cell_Type == "HFF" & Probe_Pair %in% c("121.142", "86.123", "91.255"),], 
+               mapping=aes(x=SpotDist.micron, color=as.factor(AreaShell.spot1.COG), group=AreaShell.spot1.COG))
+
+plot + stat_ecdf(size=1) +
+  facet_wrap(. ~ Probe_Pair, nrow=3) +
+  theme(strip.text = element_blank())+
+  scale_color_viridis_d("Equi-Area\nShell (Bait)") +
+  scale_x_log10("2D Distance (microns; log10)", limits=c(0.05,20)) +
+  scale_y_continuous("Cumulative\nFrequency", breaks=c(0,1))
+```
+
+```{r CDFS_rpos_by_threshold.spot1.52_255, fig.width=6.5, fig.height=2}
+dt.all.filtered.coopvsadd <- melt(dt.all.filtered[Cell_Type=="HFF" & Probe_Pair %in% c("52.255", "52.89", "11.52")], 
+                                  id.vars = c("AssayIndex", "nrow", "ncol", "FieldIndex", "CellIndex", 
+                                              "SpotIndex1", "SpotIndex2", "Probe1", "Probe2", "Probe_Pair",
+                                              "Cell_Type", "Culture_Condition", "Region",
+                                              "SpotDist.micron", "SpotDist.Threshold", "SpotDist.nudged"), 
+                                  measure.vars = c("Spot1.r.cog", "Spot2.r.cog"), 
+                                  variable.name = "Locus", 
+                                  value.name = "r.cog")
+
+plot <- ggplot(dt.all.filtered.coopvsadd[SpotDist.Threshold != "D (100nm)",], 
+               mapping=aes(x=r.cog, color=as.factor(SpotDist.Threshold), group=SpotDist.Threshold))
+
+plot + stat_ecdf(size=1) +
+  facet_grid(Locus ~ Probe_Pair)+
+  scale_color_viridis_d("Equi-Area\nShell (Bait)") +
+  scale_x_continuous("2D Distance (microns; log10)", limits=c(0,1), breaks=c(0,1)) +
+  scale_y_continuous("Cumulative\nFrequency")
+```
+
+```{r CDFS_rpos_by_threshold.all_overplotted, fig.width=6.5, fig.height=3}
+plot <- ggplot(dt.all.filtered.coopvsadd[SpotDist.Threshold != "D (100nm)",], 
+               mapping=aes(x=r.cog, 
+                           linetype = as.factor(Locus),
+                           color = as.factor(SpotDist.Threshold),
+                           group=interaction(as.factor(Locus), as.factor(SpotDist.Threshold))))
+
+plot + stat_ecdf(size=1) +
+  facet_grid(. ~ Probe_Pair)+
+  scale_color_viridis_d("Distance Threshold") +
+  scale_linetype("Locus for Radial Position") +
+  theme(legend.position="bottom", legend.box="vertical")+
+  scale_x_continuous("2D Distance (microns; log10)", limits=c(0,1), breaks=c(0,1)) +
+  scale_y_continuous("Cumulative\nFrequency")
+```
+
+```{r cdf.dist.by.shell.11v52.forbranch, fig.width=4.5, fig.height=3}
+plot <- ggplot(dt.all.filtered.coopvsadd[SpotDist.Threshold != "D (100nm)" & Probe_Pair == "11.52",], 
+               mapping=aes(x=r.cog, color=as.factor(SpotDist.Threshold), group=SpotDist.Threshold))
+
+plot + stat_ecdf(size=1) +
+  facet_grid(Locus ~ Probe_Pair)+
+  scale_color_viridis_d("2D Distance\nThreshold") +
+  scale_x_continuous("Radial Position", limits=c(0,1), breaks=c(0,1)) +
+  scale_y_continuous("Cumulative\nFrequency")
+```
+
+```{r cdf.dist.by.shell.52v89.forbranch, fig.width=4.5, fig.height=3}
+plot <- ggplot(dt.all.filtered.coopvsadd[SpotDist.Threshold != "D (100nm)" & Probe_Pair == "52.89",], 
+               mapping=aes(x=r.cog, color=as.factor(SpotDist.Threshold), group=SpotDist.Threshold))
+
+plot + stat_ecdf(size=1) +
+  facet_grid(Locus ~ Probe_Pair)+
+  scale_color_viridis_d("2D Distance\nThreshold") +
+  scale_x_continuous("Radial Position", limits=c(0,1), breaks=c(0,1)) +
+  scale_y_continuous("Cumulative\nFrequency")
+```
+
+```{r cdf.dist.by.shell.52v255.forbranch, fig.width=4.5, fig.height=3}
+plot <- ggplot(dt.all.filtered.coopvsadd[SpotDist.Threshold != "D (100nm)" & Probe_Pair == "52.255",], 
+               mapping=aes(x=r.cog, color=as.factor(SpotDist.Threshold), group=SpotDist.Threshold))
+
+plot + stat_ecdf(size=1) +
+  facet_grid(Locus ~ Probe_Pair)+
+  scale_color_viridis_d("2D Distance\nThreshold") +
+  scale_x_continuous("Radial Position", limits=c(0,1), breaks=c(0,1)) +
+  scale_y_continuous("Cumulative\nFrequency")
+```
+
+52-91-994 CDFs to show preference changes at different positions
+```{r rcdf.spotdist.by.radshell1.52.91.994, fig.height=3, fig.width=3}
+dt.samp <- dt.all.filtered[chr==1 & Probe1 == 52 & Probe2 %in% c(91, 994) & AreaShell.spot1.COG < 5,]
+
+plot <- ggplot(dt.samp, mapping=aes(x=SpotDist.micron, color=Probe2))
+
+plot + stat_ecdf(size=1, aes(color=as.factor(Probe2))) + 
+  facet_grid(AreaShell.spot1.COG~.) +
+  scale_color_viridis_d("Target\nProbe") + 
+  scale_x_log10("2D Distance to LAD", limits=c(0.05,20)) +
+  scale_y_continuous("Cumulative Frequency", limits=c(0,1), breaks=c(0,1))
+```
+
+```{r rcdf.spotdist.by.radshell1.52.91.994.forbranch, fig.height=2, fig.width=7}
+dt.samp <- dt.all.filtered[chr==1 & Probe1 == 52 & Probe2 %in% c(91, 120, 994) & AreaShell.spot1.COG < 5,]
+
+plot <- ggplot(dt.samp, mapping=aes(x=SpotDist.micron, color=Probe2))
+
+plot + stat_ecdf(size=1, aes(color=as.factor(Probe2))) + 
+  facet_grid(.~AreaShell.spot1.COG) +
+  scale_color_viridis_d("Target\nProbe") + 
+  scale_x_continuous("2D Distance to 52", limits=c(0.1,8.1)) +
+  scale_y_continuous("Cumulative\nFrequency", limits=c(0,1), breaks=c(0,1))
+```
+
+# Figure 4
+
+```{r barchart_radPos_HFFvH1, fig.width=6.5, fig.height=2}
+plot <- ggplot(dt.spots[Probe %in% c(11, 23, 52, 73, 74, 80, 89, 91, 120),], 
+               mapping=aes(x=as.factor(Cell_Type), fill=as.factor(AreaShell.COG)))
+
+plot + geom_bar(position="fill", stat="count") +
+  facet_grid(.~Probe, scales="free") +
+  scale_fill_viridis_d("Equi-Area\nShell") +
+  scale_x_discrete("Probe") +
+  scale_y_continuous("Proportion\nof Spots")
+```
+
+
+```{r CDFS_spotDist_byProbe_byCellType_All, fig.width=6.5, fig.height=2}
+plot <- ggplot(dt.all.filtered[Probe_Pair %in% intersected_ProbePairs,], 
+               mapping=aes(x=SpotDist.micron, color=Genomic_Distance, group=Probe_Pair))
+
+plot + stat_ecdf(size=1) +
+  facet_grid(.~Cell_Type) +
+  scale_color_viridis_c("Genomic Distance") +
+  scale_x_continuous("2D Distance (microns)", limits=c(0,15), breaks=c(0,5,10,15)) +
+  scale_y_continuous("Cumulative\nFrequency", limits=c(0,1), breaks=c(0,0.5,1))
+```
+
+```{r CDFS_spotDist_byPair_byCellType_Reps, fig.height=3.5, fig.width=4}
+plot <- ggplot(dt.all.filtered[Probe_Pair %in% c("11.52", "23.52", "52.73"),], 
+               mapping=aes(x=SpotDist.micron, color=Cell_Type))
+
+plot + stat_ecdf(size=1) +
+  facet_wrap(Probe_Pair~., nrow=3) +
+  scale_color_viridis_d("Cell Type") +
+  scale_x_log10("2D Distance (microns)", limits=c(0.05,20), breaks=c(0.1,1,10)) +
+  scale_y_continuous("Cumulative\nFrequency", limits=c(0,1), breaks=c(0,0.5,1))
+```
+
+```{r CDFS_spotDist_byPair_byCellType_Reps.forbranch, fig.height=2, fig.width=3.5}
+plot <- ggplot(dt.all.filtered[Probe_Pair %in% c("23.52","52.74"),], 
+               mapping=aes(x=SpotDist.micron, color=Cell_Type))
+
+plot + stat_ecdf(size=1) +
+  facet_wrap(Probe_Pair~., nrow=2) +
+  scale_color_viridis_d("Cell Type") +
+  scale_x_log10("2D Distance (microns)", limits=c(0.05,20), breaks=c(0.1,1,10)) +
+  scale_y_continuous("Cumulative\nFrequency", limits=c(0,1), breaks=c(0,0.5,1))
+```
+
+```{r CDFS_spotDist_byPair_byShell_Reps, fig.width=6.5, fig.height=3}
+plot <- ggplot(dt.all.filtered[Probe_Pair %in% c("11.74", "11.52", "11.89"),], 
+               mapping=aes(x=SpotDist.micron, color=as.factor(AreaShell.spot1.COG), group=as.factor(AreaShell.spot1.COG)))
+
+plot + stat_ecdf(size=1) +
+  facet_grid(Cell_Type ~ Probe_Pair) +
+  scale_color_viridis_d("Equi-\nArea\nShell", position="bottom") +
+  scale_x_log10("2D Distance (microns)", limits=c(0.05,20), breaks=c(0.1,1,10)) +
+  scale_y_continuous("Cumulative\nFrequency", limits=c(0,1), breaks=c(0,0.5,1))
+```
+
+# Fig 5
+
+Heat map: color is coefficient (directional), alpha is p-value (brighter = more significant)
+```{r heatmaps.spot1.rvdist.H1, fig.width=2.5, fig.height=2.5}
+plot <- ggplot(dt.lms[dt.lms$Cell_Type == "H1",], 
+               mapping=aes(x=as.factor(Probe1), y=as.factor(Probe2), 
+                           fill=Spot1.M, alpha=-log10(Spot1.P)))
+
+plot + geom_tile() +
+  theme(legend.position="none")+
+  scale_x_discrete("Upstream Probe") + 
+  scale_y_discrete("Downstream Probe") +
+  ggtitle("Upstream Spot") +
+  scale_alpha_continuous("Significance\n(log10)", limits=c(0,10))+
+  scale_fill_viridis_c("Slope", limits=c(-13.007, 13.007))
+```
+
+```{r heatmaps.spot2.rvdist.H1, fig.width=4, fig.height=2.5}
+plot <- ggplot(dt.lms[dt.lms$Cell_Type == "H1",], 
+               mapping=aes(x=as.factor(Probe1), y=as.factor(Probe2), 
+                           fill=Spot2.M, alpha=-log10(Spot2.P)))
+
+plot + geom_tile() +
+  theme(legend.position="right", legend.box="horizontal")+
+  ggtitle("Downstream Spot") +
+  scale_x_discrete("Upstream Probe") + 
+  scale_y_discrete("Downstream Probe") +
+  scale_alpha_continuous("Sig.\n(log10)", limits = c(0,10), guide=guide_legend(keyheight=1))+
+  scale_fill_viridis_c("Slope", limits=c(-13.007, 13.007), guide=guide_colorbar(barheight=7))
+```
+
+```{r barchart_radPos_pooled, fig.width=6.5, fig.height=5}
+plot <- ggplot(dt.all.filtered[Cell_Type=="HFF" & !(chr == 18 & Probe1 == 89),], 
+               mapping=aes(x=as.factor(SpotDist.Threshold), fill=as.factor(AreaShell.spot1.COG)))
+
+plot + geom_bar(position="fill", stat="count") +
+  facet_wrap(.~interaction(chr,Probe1), nrow=6) +
+  theme(strip.background=element_blank(), strip.text=element_blank())+
+  scale_fill_viridis_d("Equi-Area\nShell") +
+  scale_x_discrete("Probe & Threshold") +
+  scale_y_continuous("Proportion of Spots")
+```
+
+
+## H1 vs HFF variability
+```{r variability_H1vHFF, fig.width=6.5, fig.height=3}
+plot <- ggplot(dt.all.subsampled[Probe_Pair %in% intersected_ProbePairs, 
+                                 list("SD" = sd(SpotDist.micron), "M" = mean(SpotDist.micron), 
+                                      "SD_M" = sd(SpotDist.micron)/mean(SpotDist.micron), 
+                                      "error_min" = 0.96*sd(SpotDist.micron)/mean(SpotDist.micron),
+                                      "error_max" = 1.05*sd(SpotDist.micron)/mean(SpotDist.micron)), 
+                                 by=list(Probe_Pair, Cell_Type)], 
+               mapping=aes(x=Probe_Pair, fill=Cell_Type, y = SD_M))
+
+plot + geom_bar(stat="identity", position="dodge", width=0.75) +
+  geom_errorbar(aes(ymin=error_min, ymax=error_max), position=position_dodge(0.75), width=0.2) +
+  scale_fill_viridis_d("Cell Type") +
+  scale_x_discrete("Probe Pair") +
+  scale_y_continuous("Coefficient of Variation")
+```
+
+```{r variability_H1vHFF_HFFspecs, fig.width=3, fig.height=2}
+plot <- ggplot(dt.all.subsampled[Probe_Pair %in% c("23.52", "52.73", "52.74", "23.80", "52.80", "52.120", "80.120"), 
+                                 list("SD" = sd(SpotDist.micron), "M" = mean(SpotDist.micron), 
+                                      "SD_M" = sd(SpotDist.micron)/mean(SpotDist.micron), 
+                                      "error_min" = 0.96*sd(SpotDist.micron)/mean(SpotDist.micron),
+                                      "error_max" = 1.05*sd(SpotDist.micron)/mean(SpotDist.micron)), 
+                                 by=list(Probe_Pair, Cell_Type)], 
+               mapping=aes(x=Probe_Pair, fill=Cell_Type, y = SD_M))
+
+plot + geom_bar(stat="identity", position="dodge", width=0.75) +
+  geom_errorbar(aes(ymin=error_min, ymax=error_max), position=position_dodge(0.75), width=0.2) +
+  scale_fill_viridis_d("Cell Type") +
+  scale_x_discrete("Probe Pair", ) +
+  scale_y_continuous("Coefficient of Variation") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+```
+
+## Supplement:
+
+All radial positions as a bar graph:
+```{r cdf_radPos_AllLoci, fig.width=7, fig.height=4}
+plot <- ggplot(dt.spots[Cell_Type == "HFF",], 
+               mapping=aes(x=as.factor(Probe), fill=as.factor(AreaShell.COG)))
+
+plot + geom_bar(position="fill", stat="count") +
+  facet_wrap(.~chr, nrow=2, scales="free") +
+  scale_fill_brewer("Equi-Area\nShell", type="div", palette=2) +
+  scale_x_discrete("Probe", labels=NULL) +
+  scale_y_continuous("Proportion of Spots")
+```
+
+Individual rad pos vs sequencing:
+
+```{r scatter_medRadPos_v_Compartment, fig.width=4, fig.height=2}
+plot <- ggplot(dt.loci.pooled.HFF, 
+               mapping=aes(y=rad.pos.median, x=Compartment, color=as.factor(rad.shell.mode)))
+
+plot + geom_point(size=2) +
+  scale_color_viridis_d("Most Common\nEqui-Area\nShell") +
+  scale_y_continuous("Median Radial\nPosition", limits=c(0,1)) +
+  scale_x_continuous("Compartment Score", limits=c(-2,1))
+```
+
+```{r scatter_medRadPos_v_H3K27, fig.width=4, fig.height=2}
+plot <- ggplot(dt.loci.pooled.HFF, 
+               mapping=aes(y=rad.pos.median, x=H3K27me3, color=as.factor(rad.shell.mode)))
+
+plot + geom_point(size=2) +
+  scale_color_viridis_d("Most Common\nEqui-Area\nShell") +
+  scale_y_continuous("Median Radial\nPosition", limits=c(0,1)) +
+  scale_x_continuous("H3K27me3 signal")
+```
+
+```{r scatter_medRadPos_v_H3K36, fig.width=4, fig.height=2.75}
+plot <- ggplot(dt.loci.pooled.HFF, 
+               mapping=aes(y=rad.pos.median, x=H3K36me3, color=as.factor(rad.shell.mode)))
+
+plot + geom_point(size=2) +
+  scale_color_viridis_d("Most Common\nEqui-Area\nShell") +
+  scale_y_continuous("Median Radial Position", limits=c(0,1)) +
+  scale_x_continuous("H3K36me3 signal", limits=c(0,3))
+```
+
+```{r scatter_medRadPos_v_H3K4, fig.width=4, fig.height=2}
+plot <- ggplot(dt.loci.pooled.HFF, 
+               mapping=aes(y=rad.pos.median, x=H3K4me3, color=as.factor(rad.shell.mode)))
+
+plot + geom_point(size=2) +
+  scale_color_viridis_d("Most Common\nEqui-Area\nShell") +
+  scale_y_continuous("Median Radial\nPosition", limits=c(0,1)) +
+  scale_x_continuous("H3K4me3 signal")
+```
+
+
+Document the information about the analysis session
+```{r sessionInfo, include=TRUE, echo=TRUE, results='markup'}
+sessionInfo()
+```
